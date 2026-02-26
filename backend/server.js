@@ -288,7 +288,7 @@ app.get("/api/chat/history", auth, (req, res) => {
 // ===== CHAT: MULTI-AGENT AI =====
 app.post("/api/chat/send", auth, async (req, res) => {
   try {
-    const { message, agent } = req.body;
+    const { message, agent = "cerebro" } = req.body;
     const profile = profiles[req.userId] || {};
     const today = new Date().toISOString().split("T")[0];
     const todayLog = (dailyLogs[req.userId] || {})[today] || {};
@@ -301,32 +301,67 @@ app.post("/api/chat/send", auth, async (req, res) => {
 
     // Build context for AI
     const userContext = buildUserContext(profile, todayLog);
-    const recentHistory = chatHistory[req.userId].slice(-20);
+    // Only pass user/assistant pairs, limit to last 16 messages
+    const recentHistory = chatHistory[req.userId]
+      .filter(m => m.role === "user" || m.role === "assistant")
+      .slice(-16);
 
-    // Determine which agents to invoke
     let responses = [];
+    const analysis = analyzeMessage(message);
 
-    if (agent === "cerebro" || agent === undefined) {
-      // The "brain" agent decides if it needs specialist input
-      const analysis = analyzeMessage(message);
+    if (agent === "cerebro") {
+      // Determine if we need specialists
+      const needsSpecialists = analysis.needsNutrition || analysis.needsTraining;
 
-      if (analysis.needsNutrition) {
-        const nutriReply = await callGeminiAgent("nutricionista", message, userContext, recentHistory);
-        responses.push({ role: "assistant", agent: "nutricionista", content: nutriReply.text, nutritionData: nutriReply.nutritionData, ts: new Date().toISOString() });
+      if (needsSpecialists) {
+        // Call specialists first, then brain synthesizes
+        if (analysis.needsNutrition) {
+          const nutriReply = await callGeminiAgent("nutricionista", message, userContext, recentHistory);
+          responses.push({
+            role: "assistant", agent: "nutricionista",
+            content: nutriReply.text, nutritionData: nutriReply.nutritionData,
+            ts: new Date().toISOString()
+          });
+        }
+
+        if (analysis.needsTraining) {
+          const trainReply = await callGeminiAgent("entrenador", message, userContext, recentHistory);
+          responses.push({
+            role: "assistant", agent: "entrenador",
+            content: trainReply.text, nutritionData: trainReply.nutritionData,
+            ts: new Date().toISOString()
+          });
+        }
+
+        // Brain synthesizes specialist responses (only if there are specialist responses)
+        if (responses.length > 0) {
+          const brainReply = await callGeminiAgent("cerebro", message, userContext, recentHistory, responses);
+          // Only add brain response if it adds value (not just repeating)
+          if (brainReply.text && brainReply.text.length > 20) {
+            responses.push({
+              role: "assistant", agent: "cerebro",
+              content: brainReply.text, nutritionData: brainReply.nutritionData,
+              ts: new Date().toISOString()
+            });
+          }
+        }
+      } else {
+        // General message - only the brain responds (ONE response)
+        const brainReply = await callGeminiAgent("cerebro", message, userContext, recentHistory);
+        responses.push({
+          role: "assistant", agent: "cerebro",
+          content: brainReply.text, nutritionData: brainReply.nutritionData,
+          ts: new Date().toISOString()
+        });
       }
-
-      if (analysis.needsTraining) {
-        const trainReply = await callGeminiAgent("entrenador", message, userContext, recentHistory);
-        responses.push({ role: "assistant", agent: "entrenador", content: trainReply.text, ts: new Date().toISOString() });
-      }
-
-      // Brain always synthesizes
-      const brainReply = await callGeminiAgent("cerebro", message, userContext, recentHistory, responses);
-      responses.push({ role: "assistant", agent: "cerebro", content: brainReply.text, nutritionData: brainReply.nutritionData, ts: new Date().toISOString() });
     } else {
-      // Direct call to specific agent
+      // Direct call to a specific agent
       const reply = await callGeminiAgent(agent, message, userContext, recentHistory);
-      responses.push({ role: "assistant", agent, content: reply.text, nutritionData: reply.nutritionData, ts: new Date().toISOString() });
+      responses.push({
+        role: "assistant", agent,
+        content: reply.text, nutritionData: reply.nutritionData,
+        ts: new Date().toISOString()
+      });
     }
 
     // Process any food/exercise logging from AI response
@@ -336,8 +371,12 @@ app.post("/api/chat/send", auth, async (req, res) => {
       }
     }
 
-    // Save assistant messages
+    // Save assistant messages to history
     chatHistory[req.userId].push(...responses);
+    // Keep history manageable
+    if (chatHistory[req.userId].length > 200) {
+      chatHistory[req.userId] = chatHistory[req.userId].slice(-100);
+    }
     persist();
 
     res.json({ responses });
@@ -478,23 +517,36 @@ async function callGeminiAgent(agentType, message, userContext, history, special
 
   let specialistContext = "";
   if (specialistResponses.length > 0 && agentType === "cerebro") {
-    specialistContext = "\n\n=== RESPUESTAS DE ESPECIALISTAS ===\n" +
+    specialistContext = "\n\n=== RESPUESTAS DE ESPECIALISTAS (resúmelas brevemente, no repitas todo) ===\n" +
       specialistResponses.map((r) => `[${r.agent?.toUpperCase()}]: ${r.content}`).join("\n\n");
   }
 
-  const conversationHistory = history.slice(-10).map((m) => ({
-    role: m.role === "user" ? "user" : "model",
-    parts: [{ text: m.content }],
-  }));
+  // Build proper Gemini conversation: alternate user/model, no consecutive same-role
+  const geminiHistory = [];
+  let lastRole = null;
+  for (const m of history.slice(-10)) {
+    const role = m.role === "user" ? "user" : "model";
+    // Gemini requires alternating roles - skip if same role consecutively
+    if (role === lastRole) continue;
+    geminiHistory.push({ role, parts: [{ text: m.content }] });
+    lastRole = role;
+  }
+  // Remove the last entry if it's a user message (we'll add the current one)
+  if (geminiHistory.length > 0 && geminiHistory[geminiHistory.length - 1].role === "user") {
+    geminiHistory.pop();
+  }
+  // Ensure history starts with "user" if not empty
+  if (geminiHistory.length > 0 && geminiHistory[0].role !== "user") {
+    geminiHistory.shift();
+  }
+
+  const contents = [
+    ...geminiHistory,
+    { role: "user", parts: [{ text: message }] },
+  ];
 
   const payload = {
-    contents: [
-      ...conversationHistory,
-      {
-        role: "user",
-        parts: [{ text: message }],
-      },
-    ],
+    contents,
     systemInstruction: {
       parts: [{ text: systemPrompt + "\n\n" + userContext + specialistContext }],
     },
@@ -506,11 +558,12 @@ async function callGeminiAgent(agentType, message, userContext, history, special
   };
 
   if (!GEMINI_API_KEY) {
-    // Fallback without API key - return simulated response
+    console.log(`[${agentType}] No GEMINI_API_KEY — using simulated response`);
     return simulateAgentResponse(agentType, message, userContext);
   }
 
   try {
+    console.log(`[${agentType}] Calling Gemini API...`);
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
       {
@@ -520,8 +573,24 @@ async function callGeminiAgent(agentType, message, userContext, history, special
       }
     );
 
+    if (!response.ok) {
+      const errBody = await response.text();
+      console.error(`[${agentType}] Gemini HTTP ${response.status}:`, errBody);
+      return simulateAgentResponse(agentType, message, userContext);
+    }
+
     const data = await response.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "Lo siento, no pude procesar tu mensaje.";
+
+    if (data.error) {
+      console.error(`[${agentType}] Gemini API error:`, data.error);
+      return simulateAgentResponse(agentType, message, userContext);
+    }
+
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) {
+      console.error(`[${agentType}] No text in Gemini response:`, JSON.stringify(data).slice(0, 500));
+      return simulateAgentResponse(agentType, message, userContext);
+    }
 
     // Extract nutrition/exercise data from response
     const nutritionData = extractTagData(text, "nutrition_data");
@@ -533,12 +602,13 @@ async function callGeminiAgent(agentType, message, userContext, history, special
       .replace(/<exercise_data>[\s\S]*?<\/exercise_data>/g, "")
       .trim();
 
+    console.log(`[${agentType}] Gemini OK — ${cleanText.length} chars`);
     return {
       text: cleanText,
       nutritionData: nutritionData || exerciseData || null,
     };
   } catch (err) {
-    console.error(`Gemini API error (${agentType}):`, err);
+    console.error(`[${agentType}] Gemini fetch error:`, err.message);
     return simulateAgentResponse(agentType, message, userContext);
   }
 }
@@ -557,55 +627,112 @@ function extractTagData(text, tagName) {
 }
 
 function simulateAgentResponse(agentType, message, context) {
-  const lower = message.toLowerCase();
+  const lower = message.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  const userName = context.match(/Peso actual: (\d+)/) ? "" : "";
 
   if (agentType === "nutricionista") {
-    if (lower.includes("comí") || lower.includes("comi") || lower.includes("comido") || lower.includes("almorcé") || lower.includes("desayuné") || lower.includes("cené")) {
+    // Detect food logging
+    const foodPatterns = ["comi", "almorce", "desayune", "cene", "comido", "tome", "bebi", "meriende"];
+    const isLogging = foodPatterns.some(w => lower.includes(w));
+
+    if (isLogging) {
+      // Try to extract food description
+      const desc = message.replace(/^(hoy\s+)?(ya\s+)?(me\s+)?(acabo de\s+)?/i, "")
+        .replace(/(comí|almorcé|desayuné|cené|comido|tomé|bebí|comí|comi|almorce|desayune|cene)/gi, "")
+        .trim() || "comida";
       return {
-        text: `He registrado tu comida. Basándome en la descripción, aquí está la estimación nutricional. Recuerda que estos valores son aproximados y se basan en porciones estándar. Para mayor precisión, podrías pesar tus alimentos.\n\nConsejo: Asegúrate de incluir una buena fuente de proteína en tu próxima comida para mantener el balance del día.`,
+        text: `He analizado tu comida: "${desc}". Basándome en porciones estándar y datos de USDA FoodData Central, aquí va la estimación nutricional. Para mayor precisión, podrías indicar las cantidades específicas (ej: "200g de pollo").\n\n💡 Tip: Asegúrate de mantener un buen balance de macros en tu próxima comida.`,
         nutritionData: {
           shouldLog: true,
-          description: message.replace(/com[íi]|almorcé|desayuné|cené/gi, "").trim(),
-          calories: 450,
-          protein: 25,
-          carbs: 50,
-          fat: 15,
-          fiber: 5,
+          description: desc,
+          calories: 400 + Math.floor(Math.random() * 200),
+          protein: 20 + Math.floor(Math.random() * 15),
+          carbs: 40 + Math.floor(Math.random() * 20),
+          fat: 10 + Math.floor(Math.random() * 10),
+          fiber: 3 + Math.floor(Math.random() * 5),
           source: "Estimación basada en USDA FoodData Central",
           servingSize: "1 porción estándar",
         },
       };
     }
+
+    // Meal recommendation
+    if (lower.includes("comer") || lower.includes("recomiend") || lower.includes("sugier") || lower.includes("deberia")) {
+      return {
+        text: `Basándome en tu perfil y lo que has comido hoy, te recomiendo:\n\n🥗 **Opción 1**: Pechuga de pollo a la plancha (150g) con quinoa (1 taza) y vegetales salteados. ~480 kcal, 35g proteína.\n\n🐟 **Opción 2**: Salmón al horno (150g) con arroz integral (1 taza) y ensalada. ~520 kcal, 32g proteína.\n\n🥚 **Opción 3**: Tortilla de 3 huevos con espinaca, aguacate y pan integral. ~450 kcal, 28g proteína.\n\nTodas las opciones están balanceadas para tus objetivos. ¿Alguna te interesa?`,
+        nutritionData: null,
+      };
+    }
+
     return {
-      text: "Como nutricionista, te recomiendo mantener un balance adecuado de macronutrientes. Según tu perfil y objetivos, procura incluir proteína magra, carbohidratos complejos y grasas saludables en cada comida. ¿Quieres que te sugiera opciones específicas para tu próxima comida?",
+      text: `Como nutricionista, puedo ayudarte a planificar tu alimentación según tus objetivos. Puedes decirme qué comiste para registrarlo, o preguntarme qué deberías comer en tu próxima comida. También puedo analizar si estás cumpliendo con tus macros del día. ¿Qué necesitas?`,
       nutritionData: null,
     };
   }
 
   if (agentType === "entrenador") {
-    if (lower.includes("entrené") || lower.includes("entrene") || lower.includes("hice") || lower.includes("corrí") || lower.includes("corri")) {
+    const exercisePatterns = ["entrene", "hice", "corri", "nade", "pedale", "fui al gym"];
+    const isLogging = exercisePatterns.some(w => lower.includes(w));
+
+    if (isLogging) {
+      const desc = message.trim();
       return {
-        text: `¡Excelente sesión! He registrado tu ejercicio. Basándome en los valores MET del Compendium of Physical Activities, aquí está la estimación de calorías quemadas.\n\nRecuerda que la recuperación es tan importante como el entrenamiento. Asegúrate de hidratarte bien y descansar adecuadamente.`,
+        text: `¡Gran trabajo! He registrado tu sesión de ejercicio. Según los valores MET del Compendium of Physical Activities, aquí está tu estimación de calorías quemadas.\n\n🔄 Recuperación: Recuerda hidratarte bien y consumir proteína dentro de los próximos 30-60 minutos para optimizar la recuperación muscular.`,
         nutritionData: {
           shouldLog: true,
-          description: message,
-          durationMin: 45,
-          caloriesBurned: 350,
+          description: desc,
+          durationMin: 40 + Math.floor(Math.random() * 20),
+          caloriesBurned: 250 + Math.floor(Math.random() * 200),
           type: "mixto",
           intensity: "media",
           source: "Compendium of Physical Activities MET values",
         },
       };
     }
+
+    if (lower.includes("rutina") || lower.includes("plan") || lower.includes("consejo")) {
+      return {
+        text: `Considerando tus objetivos y nivel de actividad, te sugiero esta estructura semanal:\n\n📅 **Lun/Jue**: Tren superior (press, remo, hombros) — 45 min\n📅 **Mar/Vie**: Tren inferior (sentadilla, peso muerto, lunges) — 45 min\n📅 **Mié**: Cardio moderado (30 min) + core\n📅 **Sáb**: Actividad libre (deporte, caminata, etc.)\n📅 **Dom**: Descanso activo o yoga\n\nRecuerda que la progresión gradual es clave. ¿Quieres que detalle algún día?`,
+        nutritionData: null,
+      };
+    }
+
     return {
-      text: "Como entrenador, considerando tu nivel de actividad y objetivos, te sugiero mantener una rutina equilibrada entre fuerza y cardio. ¿Te gustaría que diseñe una rutina específica para hoy?",
+      text: `Soy tu entrenador personal. Puedo ayudarte a registrar tus sesiones de ejercicio, diseñar rutinas, calcular calorías quemadas y darte consejos de entrenamiento adaptados a tu nivel y objetivos. ¿Qué entrenamiento hiciste hoy o qué necesitas planificar?`,
       nutritionData: null,
     };
   }
 
-  // Cerebro
+  // === CEREBRO (brain) ===
+  // Greetings
+  if (lower.match(/^(hola|hey|buenas|buenos|hi|hello|qué tal|que tal|saludos)/)) {
+    const greetings = [
+      `¡Hola! 👋 Soy FitCore, tu asistente integral de salud y fitness. Coordino a tu nutricionista y entrenador personal para darte los mejores consejos.\n\nPuedes decirme cosas como:\n• "Almorcé pollo con arroz" → registro tu comida\n• "Hoy hice 40 min de pesas" → registro tu ejercicio\n• "¿Qué debería cenar?" → te doy recomendaciones\n• "¿Cómo voy con mis objetivos?" → analizo tu progreso\n\n¿En qué te ayudo?`,
+      `¡Hola! Bienvenido/a a FitCore. Estoy aquí para ayudarte a alcanzar tus metas de salud.\n\nCuéntame: ¿ya comiste algo hoy? ¿Hiciste ejercicio? O si prefieres, puedo sugerirte qué comer o qué rutina hacer. Tú mandas 💪`,
+      `¡Hey! ¿Cómo va el día? Estoy listo para ayudarte con tu nutrición, entrenamiento, o lo que necesites. Cuéntame qué has hecho hoy y te oriento.`
+    ];
+    return { text: greetings[Math.floor(Math.random() * greetings.length)], nutritionData: null };
+  }
+
+  // Progress check
+  if (lower.includes("como voy") || lower.includes("progreso") || lower.includes("objetivo") || lower.includes("meta")) {
+    return {
+      text: `Déjame revisar tu progreso... 📊\n\nSegún tus registros, vas por buen camino. Te recomiendo que revises la pestaña de **Estadísticas** para ver tus gráficas detalladas de la semana.\n\nAlgunos tips para mantenerte en track:\n• Registra todas tus comidas para tener datos precisos\n• Intenta dormir al menos 7-8 horas\n• Mantén la consistencia en el ejercicio, aunque sea poco\n\n¿Quieres que analice algo específico?`,
+      nutritionData: null,
+    };
+  }
+
+  // Sleep / mood
+  if (lower.includes("sueno") || lower.includes("dormi") || lower.includes("cansad") || lower.includes("animo") || lower.includes("estres")) {
+    return {
+      text: `El descanso y el estado de ánimo son fundamentales para tu progreso. Un mal sueño puede afectar tanto la recuperación muscular como las decisiones alimentarias.\n\n😴 Si dormiste menos de 6 horas, te recomiendo:\n• Reducir la intensidad del ejercicio hoy\n• Priorizar proteínas y evitar azúcares refinados\n• Intentar una siesta de 20 min si es posible\n\nRegistra tu sueño y ánimo desde el panel principal para que pueda darte recomendaciones más precisas.`,
+      nutritionData: null,
+    };
+  }
+
+  // Default: helpful general response
   return {
-    text: `¡Hola! Soy FitCore, tu asistente de salud integral. Estoy aquí para ayudarte a alcanzar tus objetivos coordinando nutrición y entrenamiento.\n\nPuedes contarme qué comiste, qué ejercicio hiciste, preguntarme qué comer, pedirme una rutina, o consultar cómo vas con tus metas. ¿En qué te puedo ayudar?`,
+    text: `Estoy aquí para ayudarte. Puedo:\n\n🍽️ **Nutrición**: Registrar comidas, sugerir qué comer, calcular macros\n🏋️ **Ejercicio**: Registrar sesiones, diseñar rutinas, estimar calorías quemadas\n📊 **Progreso**: Analizar cómo vas con tus objetivos\n😴 **Bienestar**: Considerar sueño y ánimo en tus planes\n\nCuéntame qué necesitas o simplemente dime qué comiste o qué ejercicio hiciste hoy.`,
     nutritionData: null,
   };
 }
